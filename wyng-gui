@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+#
+# GUI for wyng-util-qubes
+# https://www.kennethrrosen.cloud
+#
+# Copyright (C) 2024 by Kenneth R. Rosen
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License;
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+import sys
+import os
+from PyQt5 import QtCore, QtGui, QtWidgets
+from qubesadmin import Qubes
+
+class CenteredWizardPage(QtWidgets.QWizardPage):
+    def __init__(self, title, parent=None):
+        super().__init__(parent)
+        self.title = title
+
+    def initializePage(self):
+        self.setTitle("")
+        title_label = QtWidgets.QLabel(self.title)
+        title_label.setAlignment(QtCore.Qt.AlignCenter)
+
+        font = title_label.font()
+        font.setBold(True)
+        font.setPointSize(16)
+        title_label.setFont(font)
+
+        self.layout().insertWidget(0, title_label)
+
+class AnimatedProgressBar(QtWidgets.QProgressBar):
+    def __init__(self):
+        super().__init__()
+        self.setRange(0, 0)
+        self.setTextVisible(False)
+
+class WyngBackupThread(QtCore.QThread):
+    update_output = QtCore.pyqtSignal(str)
+    update_status = QtCore.pyqtSignal(str)
+    finished_successfully = QtCore.pyqtSignal()
+
+    def __init__(self, action, options, dest, password, init_archive):
+        super().__init__()
+        self.action = action
+        self.options = options
+        self.dest = dest
+        self.password = password
+        self.init_archive = init_archive
+
+    def run(self):
+        try:
+            if self.init_archive:
+                init_cmd = ['/bin/wyng', 'arch-init', '--dest=' + self.dest]
+                self.execute_command(init_cmd, "Initializing archive...")
+
+            wyng_cmd = ['/bin/wyng-util-qubes', self.action] + self.options + ['--dest=' + self.dest]
+            self.execute_command(wyng_cmd, "Performing backup...")
+
+        except Exception as ex:
+            self.update_output.emit(str(ex))
+
+    def execute_command(self, command, status_message):
+        self.update_status.emit(status_message)
+        process = QtCore.QProcess()
+        process.setProcessChannelMode(QtCore.QProcess.MergedChannels)
+        process.start(command[0], command[1:])
+
+        if not process.waitForStarted():
+            self.update_output.emit(f"Failed to start: {command}")
+            return
+
+        process.write(self.password.encode())
+        process.closeWriteChannel()
+
+        output_buffer = ""
+        while process.state() == QtCore.QProcess.Running:
+            process.waitForReadyRead(100)
+            output = process.readAllStandardOutput().data().decode()
+            if output:
+                output_buffer += output
+                lines = output_buffer.splitlines(True)
+                for line in lines[:-1]:
+                    self.update_output.emit(line.strip())
+                output_buffer = lines[-1]
+
+        if process.exitStatus() == QtCore.QProcess.NormalExit and process.exitCode() == 0:
+            if 'Performing backup' in status_message:
+                self.update_output.emit("Backup process completed.")
+                self.finished_successfully.emit()
+            else:
+                self.update_output.emit(f"{status_message} completed.")
+        else:
+            self.update_output.emit(process.readAllStandardError().data().decode())
+            self.update_output.emit("Backup encountered an error.")
+
+class WyngBackupVMsWindow(QtWidgets.QWizard):
+    def __init__(self):
+        super().__init__()
+
+        self.qubes_app = Qubes()
+        self.selected_vms = []
+        self.thread = None
+
+        self.setWindowTitle("Wyng Backup VMs")
+        self.setGeometry(300, 300, 700, 500)
+        self.center()
+
+        self.create_destination_password_and_select_vms_page()
+        self.create_commit_page()
+
+        self.currentIdChanged.connect(self.current_page_changed)
+
+    def center(self):
+        screen = QtWidgets.QApplication.primaryScreen().availableGeometry()
+        window = self.frameGeometry()
+        window.moveCenter(screen.center())
+        self.move(window.topLeft())
+
+    def create_destination_password_and_select_vms_page(self):
+        self.dest_pass_vms_page = CenteredWizardPage("Wyng-util-Qubes GUI")
+
+        layout = QtWidgets.QVBoxLayout()
+
+        layout.addWidget(QtWidgets.QLabel("Backup destination:"))
+        self.destination_edit = QtWidgets.QLineEdit()
+        layout.addWidget(self.destination_edit)
+
+        examples_label = QtWidgets.QLabel(
+            "Examples:\n"
+            "file:/path\n"
+            "ssh://user@example.com[:port][/path]\n"
+            "qubes://vm-name[/path]\n"
+            "qubes-ssh://vm-name:me@example.com[:port][/path]"
+        )
+        layout.addWidget(examples_label)
+
+        layout.addWidget(QtWidgets.QLabel("Enter password (must be 10 or more characters):"))
+        self.password_edit = QtWidgets.QLineEdit()
+        self.password_edit.setEchoMode(QtWidgets.QLineEdit.Password)
+        layout.addWidget(self.password_edit)
+
+        self.init_archive_checkbox = QtWidgets.QCheckBox("Initialize archive at destination if needed")
+        layout.addWidget(self.init_archive_checkbox)
+
+        layout.addWidget(QtWidgets.QLabel("VMs to backup:"))
+        self.vms_list = QtWidgets.QListWidget()
+        self.vms_list.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
+        layout.addWidget(self.vms_list)
+        self.populate_vms_list()
+
+        self.dest_pass_vms_page.setLayout(layout)
+        self.addPage(self.dest_pass_vms_page)
+
+    def populate_vms_list(self):
+        for vm in self.qubes_app.domains:
+            item = QtWidgets.QListWidgetItem(vm.name)
+            self.vms_list.addItem(item)
+
+    def create_commit_page(self):
+        self.commit_page = CenteredWizardPage("Backup Progress")
+        layout = QtWidgets.QVBoxLayout()
+
+        # Add animated progress bar
+        self.animated_bar = AnimatedProgressBar()
+        layout.addWidget(self.animated_bar)
+
+        self.commit_status = QtWidgets.QLabel("Backup in progress...")
+        layout.addWidget(self.commit_status)
+
+        self.output_box = QtWidgets.QTextEdit()
+        self.output_box.setReadOnly(True)
+        layout.addWidget(self.output_box)
+
+        self.commit_page.setLayout(layout)
+        self.addPage(self.commit_page)
+
+    def current_page_changed(self, page_id):
+        if self.currentPage() is self.commit_page:
+            self.selected_vms = [item.text() for item in self.vms_list.selectedItems()]
+            self.start_backup()
+            self.button(QtWidgets.QWizard.FinishButton).setEnabled(False)
+
+    def start_backup(self):
+        dest = self.destination_edit.text()
+        password = self.password_edit.text()
+        init_archive = self.init_archive_checkbox.isChecked()
+        self.thread = WyngBackupThread('backup', self.selected_vms, dest, password, init_archive)
+        self.thread.finished.connect(self.backup_finished)
+        self.thread.update_output.connect(self.update_output)
+        self.thread.update_status.connect(self.update_status)
+        self.thread.finished_successfully.connect(self.backup_completed)
+        self.thread.start()
+
+    def backup_finished(self):
+        self.commit_status.setText("Backup encountered an error.")
+        self.button(QtWidgets.QWizard.FinishButton).setEnabled(True) 
+
+    def backup_completed(self):
+        self.animated_bar.setRange(0, 1)  # Stop the animated bar
+        self.animated_bar.setValue(1)  # Set to 100%
+        self.commit_status.setText("Backup finished successfully.")
+        self.button(QtWidgets.QWizard.FinishButton).setEnabled(True) 
+        self.show_completion_popup()
+
+    def update_output(self, output):
+        self.output_box.append(output)
+
+    def update_status(self, status):
+        self.commit_status.setText(status)
+
+    def show_completion_popup(self):
+        msg_box = QtWidgets.QMessageBox()
+        msg_box.setIcon(QtWidgets.QMessageBox.Information)
+        msg_box.setWindowTitle("Backup Completed")
+        msg_box.setText("Backup process completed successfully.")
+        msg_box.setStandardButtons(QtWidgets.QMessageBox.Ok)
+        msg_box.exec_()
+
+def main():
+    if os.geteuid() != 0:
+        sys.exit("This script must be run as root")
+
+    os.environ['XDG_RUNTIME_DIR'] = '/tmp/runtime-root'
+
+    app = QtWidgets.QApplication(sys.argv)
+    window = WyngBackupVMsWindow()
+    window.show()
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()
